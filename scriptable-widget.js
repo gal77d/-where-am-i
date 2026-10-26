@@ -1,5 +1,5 @@
 // ווידג'ט "איפה אני" לאפליקציית Scriptable (iOS)
-// מציג על מסך הבית את הטמפרטורה ושם המקום לפי המיקום הנוכחי.
+// מציג על מסך הבית את הטמפרטורה, מזג האוויר ושם המקום לפי המיקום הנוכחי.
 // לחיצה על הווידג'ט פותחת את האתר.
 
 const SITE = 'https://gal77d.github.io/-where-am-i/';
@@ -18,10 +18,19 @@ async function getLocation() {
   }
 }
 
-async function getTemp(lat, lon) {
-  const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m`;
+async function getWeather(lat, lon) {
+  const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}` +
+    '&current=temperature_2m,apparent_temperature,weather_code,is_day' +
+    '&daily=temperature_2m_max,temperature_2m_min&timezone=auto&forecast_days=1';
   const d = await new Request(url).loadJSON();
-  return Math.round(d.current.temperature_2m);
+  return {
+    temp: Math.round(d.current.temperature_2m),
+    feels: Math.round(d.current.apparent_temperature),
+    code: d.current.weather_code,
+    isDay: d.current.is_day === 1,
+    max: Math.round(d.daily.temperature_2m_max[0]),
+    min: Math.round(d.daily.temperature_2m_min[0])
+  };
 }
 
 async function getPlace(lat, lon) {
@@ -34,36 +43,87 @@ async function getPlace(lat, lon) {
   }
 }
 
+// קוד מזג אוויר (WMO) → סמל SF Symbols וצבע
+function weatherIcon(code, isDay) {
+  if (code === 0) return isDay ? ['sun.max.fill', '#fde047'] : ['moon.stars.fill', '#e2e8f0'];
+  if (code <= 2) return isDay ? ['cloud.sun.fill', '#fde047'] : ['cloud.moon.fill', '#e2e8f0'];
+  if (code === 3) return ['cloud.fill', '#e2e8f0'];
+  if (code <= 48) return ['cloud.fog.fill', '#cbd5e1'];
+  if (code <= 57) return ['cloud.drizzle.fill', '#bae6fd'];
+  if (code === 65 || code === 82) return ['cloud.heavyrain.fill', '#7dd3fc'];
+  if (code <= 67 || (code >= 80 && code <= 82)) return ['cloud.rain.fill', '#7dd3fc'];
+  if (code <= 86) return ['cloud.snow.fill', '#f8fafc'];
+  return ['cloud.bolt.rain.fill', '#fbbf24'];
+}
+
+// רקע לפי הטמפרטורה, ורקע לילה אחרי השקיעה
+function background(temp, isDay) {
+  let colors;
+  if (!isDay) colors = ['#1e1b4b', '#0f172a'];
+  else if (temp < 10) colors = ['#1d4ed8', '#1e3a8a'];
+  else if (temp < 20) colors = ['#0891b2', '#155e75'];
+  else if (temp < 28) colors = ['#ea580c', '#9a3412'];
+  else colors = ['#dc2626', '#7f1d1d'];
+  const g = new LinearGradient();
+  g.colors = colors.map(c => new Color(c));
+  g.locations = [0, 1];
+  return g;
+}
+
+function addText(stack, text, font, color, opacity = 1) {
+  const t = stack.addText(text);
+  t.font = font;
+  t.textColor = new Color(color, opacity);
+  t.lineLimit = 1;
+  t.minimumScaleFactor = 0.6;
+  return t;
+}
+
 async function buildWidget() {
   const w = new ListWidget();
   w.url = SITE;
-  w.backgroundColor = new Color('#0f172a');
-  w.setPadding(14, 14, 14, 14);
+  w.setPadding(12, 14, 12, 14);
   w.refreshAfterDate = new Date(Date.now() + 15 * 60 * 1000); // רענון כל ~15 דקות
 
-  const label = w.addText('איפה אני');
-  label.font = Font.mediumSystemFont(12);
-  label.textColor = new Color('#94a3b8');
-
-  w.addSpacer();
-
   const loc = await getLocation();
-  let temp = '--°', place = 'אין מיקום';
+  let weather = null, place = 'אין מיקום';
   if (loc) {
-    try { temp = (await getTemp(loc.latitude, loc.longitude)) + '°'; } catch (e) {}
+    try { weather = await getWeather(loc.latitude, loc.longitude); } catch (e) {}
     place = (await getPlace(loc.latitude, loc.longitude)) || '';
   }
 
-  const t = w.addText(temp);
-  t.font = Font.boldSystemFont(44);
-  t.textColor = new Color('#f1f5f9');
-  t.minimumScaleFactor = 0.6;
+  if (!weather) {
+    w.backgroundColor = new Color('#0f172a');
+    addText(w, place, Font.semiboldSystemFont(14), '#38bdf8');
+    w.addSpacer();
+    addText(w, '--°', Font.boldSystemFont(40), '#f1f5f9');
+    addText(w, 'אין נתוני מזג אוויר', Font.systemFont(12), '#94a3b8');
+    return w;
+  }
 
-  const pl = w.addText(place);
-  pl.font = Font.semiboldSystemFont(14);
-  pl.textColor = new Color('#38bdf8');
-  pl.lineLimit = 1;
-  pl.minimumScaleFactor = 0.7;
+  w.backgroundGradient = background(weather.temp, weather.isDay);
+
+  // שורה עליונה: אייקון מזג אוויר + שם המקום
+  const top = w.addStack();
+  top.centerAlignContent();
+  const [symbol, tint] = weatherIcon(weather.code, weather.isDay);
+  const icon = top.addImage(SFSymbol.named(symbol).image);
+  icon.imageSize = new Size(26, 26);
+  icon.tintColor = new Color(tint);
+  top.addSpacer(6);
+  addText(top, place, Font.semiboldSystemFont(14), '#ffffff');
+
+  w.addSpacer();
+
+  addText(w, weather.temp + '°', Font.boldSystemFont(40), '#ffffff');
+  addText(w, `מרגיש כמו ${weather.feels}°`, Font.mediumSystemFont(12), '#ffffff', 0.85);
+  addText(w, `↑${weather.max}°  ↓${weather.min}°`, Font.mediumSystemFont(12), '#ffffff', 0.85);
+
+  w.addSpacer(4);
+
+  const df = new DateFormatter();
+  df.dateFormat = 'HH:mm';
+  addText(w, `עודכן ${df.string(new Date())}`, Font.systemFont(10), '#ffffff', 0.6);
 
   return w;
 }
