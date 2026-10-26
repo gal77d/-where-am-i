@@ -20,10 +20,15 @@ async function getLocation() {
 
 async function getWeather(lat, lon) {
   const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}` +
-    '&current=temperature_2m,apparent_temperature,weather_code,is_day' +
-    '&daily=temperature_2m_max,temperature_2m_min&timezone=auto&forecast_days=1';
+    '&current=temperature_2m,apparent_temperature,weather_code,is_day,precipitation' +
+    '&minutely_15=precipitation&forecast_minutely_15=32' +
+    '&daily=temperature_2m_max,temperature_2m_min,sunrise,sunset&timezone=auto&forecast_days=2';
   const d = await new Request(url).loadJSON();
+  // כל הזמנים מגיעים בשעון המקומי של המיקום, אז משווים אותם זה לזה
+  const now = new Date(d.current.time);
   return {
+    rain: rainText(now, d.current.precipitation, d.minutely_15),
+    sun: sunText(now, d.current.is_day === 1, d.daily),
     temp: Math.round(d.current.temperature_2m),
     feels: Math.round(d.current.apparent_temperature),
     code: d.current.weather_code,
@@ -31,6 +36,33 @@ async function getWeather(lat, lon) {
     max: Math.round(d.daily.temperature_2m_max[0]),
     min: Math.round(d.daily.temperature_2m_min[0])
   };
+}
+
+function fmtDuration(ms) {
+  const min = Math.max(0, Math.round(ms / 60000));
+  if (min < 60) return `${min} דק׳`;
+  return `${Math.floor(min / 60)}:${String(min % 60).padStart(2, '0')} שע׳`;
+}
+
+// גשם ב-8 השעות הקרובות, ברזולוציה של רבע שעה
+function rainText(now, currentPrecip, m) {
+  if (currentPrecip >= 0.1) return '☔ יורד גשם עכשיו';
+  for (let i = 0; i < m.time.length; i++) {
+    const t = new Date(m.time[i]);
+    if (t < now) continue;
+    if (m.precipitation[i] >= 0.1) {
+      const ms = t - now;
+      return ms < 15 * 60000 ? '☔ גשם בקרוב' : `☔ גשם בעוד ${fmtDuration(ms)}`;
+    }
+  }
+  return '🌂 יבש ב-8 שעות הקרובות';
+}
+
+function sunText(now, isDay, daily) {
+  const sunset = new Date(daily.sunset[0]);
+  if (isDay && sunset > now) return `🌅 שקיעה בעוד ${fmtDuration(sunset - now)}`;
+  const sunrise = new Date(now < new Date(daily.sunrise[0]) ? daily.sunrise[0] : daily.sunrise[1]);
+  return `🌄 זריחה בעוד ${fmtDuration(sunrise - now)}`;
 }
 
 async function getPlace(lat, lon) {
@@ -82,7 +114,7 @@ function addText(stack, text, font, color, opacity = 1) {
 async function buildWidget() {
   const w = new ListWidget();
   w.url = SITE;
-  w.setPadding(12, 14, 12, 14);
+  w.setPadding(10, 12, 10, 12);
   w.refreshAfterDate = new Date(Date.now() + 15 * 60 * 1000); // רענון כל ~15 דקות
 
   const loc = await getLocation();
@@ -115,15 +147,16 @@ async function buildWidget() {
 
   w.addSpacer();
 
-  addText(w, weather.temp + '°', Font.boldSystemFont(40), '#ffffff');
-  addText(w, `מרגיש כמו ${weather.feels}°`, Font.mediumSystemFont(12), '#ffffff', 0.85);
-  addText(w, `↑${weather.max}°  ↓${weather.min}°`, Font.mediumSystemFont(12), '#ffffff', 0.85);
+  addText(w, weather.temp + '°', Font.boldSystemFont(34), '#ffffff');
+  addText(w, `↑${weather.max}° ↓${weather.min}° · מרגיש ${weather.feels}°`, Font.mediumSystemFont(11), '#ffffff', 0.85);
+  addText(w, weather.rain, Font.mediumSystemFont(11), '#ffffff', 0.85);
+  addText(w, weather.sun, Font.mediumSystemFont(11), '#ffffff', 0.85);
 
-  w.addSpacer(4);
+  w.addSpacer(2);
 
   const df = new DateFormatter();
   df.dateFormat = 'HH:mm';
-  addText(w, `עודכן ${df.string(new Date())}`, Font.systemFont(10), '#ffffff', 0.6);
+  addText(w, `עודכן ${df.string(new Date())}`, Font.systemFont(9), '#ffffff', 0.6);
 
   return w;
 }
