@@ -23,6 +23,17 @@
   #temp { font-size: 32px; }
   #map { flex: 1; }
   #status { padding: 8px 16px; font-size: 13px; color: #fbbf24; background: #1e293b; }
+  #ride { padding: 0 16px 16px; background: #1e293b; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  #rideBtn { flex: 0 0 auto; border: 0; border-radius: 12px; padding: 14px 18px; font: inherit; font-size: 16px; font-weight: 700; color: #0f172a; background: #4ade80; cursor: pointer; }
+  #rideBtn.on { background: #f87171; }
+  #rideStats { flex: 1; display: none; gap: 8px; min-width: 220px; }
+  #rideStats.show { display: flex; }
+  #rideStats > div { flex: 1; background: #334155; border-radius: 10px; padding: 6px 8px; text-align: center; }
+  #rideStats .value { font-size: 17px; }
+  #rideStats .label { margin: 0; font-size: 11px; }
+  #rideNote { width: 100%; font-size: 12px; color: #94a3b8; display: none; }
+  .locate-btn { width: 40px; height: 40px; font-size: 20px; line-height: 40px; text-align: center; background: #fff; color: #0f172a; cursor: pointer; border-radius: 4px; }
+  .locate-btn.active { background: #38bdf8; }
 </style>
 </head>
 <body>
@@ -33,14 +44,57 @@
     <div class="card"><div class="label">דיוק</div><div class="value" id="acc" style="font-size:15px">--</div></div>
   </div>
   <div id="status">מבקש גישה למיקום...</div>
+  <div id="ride">
+    <button id="rideBtn">🚴 התחל רכיבה</button>
+    <div id="rideStats">
+      <div><div class="value" id="rDist">0.00</div><div class="label">ק״מ</div></div>
+      <div><div class="value" id="rTime">0:00</div><div class="label">זמן</div></div>
+      <div><div class="value" id="rSpeed">0</div><div class="label">קמ״ש</div></div>
+      <div><div class="value" id="rAvg">0</div><div class="label">ממוצע</div></div>
+    </div>
+    <div id="rideNote">המסך יישאר דלוק בזמן רכיבה. אם סוגרים את האפליקציה, הרכיבה נשמרת וממשיכה כשחוזרים.</div>
+  </div>
   <div id="map"></div>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
   const map = L.map('map').setView([32.0853, 34.7818], 13);
-  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-    attribution: '&copy; OpenStreetMap'
+  const osm = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19, attribution: '&copy; OpenStreetMap'
+  });
+  const cyclosm = L.tileLayer('https://{s}.tile-cyclosm.openstreetmap.fr/cyclosm/{z}/{x}/{y}.png', {
+    maxZoom: 20, attribution: '&copy; OpenStreetMap, CyclOSM'
   }).addTo(map);
+  const bikeRoutes = L.tileLayer('https://tile.waymarkedtrails.org/cycling/{z}/{x}/{y}.png', {
+    maxZoom: 18, opacity: 0.8, attribution: '&copy; waymarkedtrails.org'
+  }).addTo(map);
+  L.control.layers(
+    { 'מפת אופניים': cyclosm, 'מפה רגילה': osm },
+    { 'מסלולי אופניים': bikeRoutes }
+  ).addTo(map);
+
+  // המפה עוקבת אחרי המיקום עד שמזיזים אותה ביד; הכפתור 📍 מחזיר את המעקב
+  let follow = true, lastLatLng = null;
+  const LocateControl = L.Control.extend({
+    options: { position: 'topleft' },
+    onAdd() {
+      const el = L.DomUtil.create('div', 'leaflet-bar locate-btn active');
+      el.textContent = '📍';
+      el.title = 'חזור למיקום שלי';
+      L.DomEvent.disableClickPropagation(el);
+      el.onclick = () => {
+        setFollow(true);
+        if (lastLatLng) map.setView(lastLatLng, Math.max(map.getZoom(), 16));
+      };
+      return el;
+    }
+  });
+  const locateCtl = new LocateControl().addTo(map);
+  function setFollow(v) {
+    follow = v;
+    locateCtl.getContainer().classList.toggle('active', v);
+  }
+  map.on('dragstart', () => setFollow(false));
 
   let marker = null, circle = null, firstFix = true;
   let lastWeatherTime = 0, lastGeoTime = 0;
@@ -85,9 +139,11 @@
       marker.setLatLng([lat, lon]);
       circle.setLatLng([lat, lon]).setRadius(accuracy);
     }
+    lastLatLng = [lat, lon];
     if (firstFix) { map.setView([lat, lon], 16); firstFix = false; }
-    else { map.panTo([lat, lon]); }
+    else if (follow) { map.panTo([lat, lon]); }
 
+    addRidePoint(lat, lon, accuracy, pos.coords.speed, pos.timestamp);
     updateWeather(lat, lon);
     updatePlace(lat, lon);
   }
@@ -101,6 +157,97 @@
     $('status').style.display = 'block';
     $('status').textContent = msgs[err.code] || 'שגיאה במיקום';
   }
+
+  // ---- רכיבה: מרחק, זמן ומהירות. נשמר בדפדפן כדי לשרוד סגירה של האפליקציה ----
+  const RIDE_KEY = 'where-am-i-ride';
+  let ride = null, wakeLock = null;
+  const ridePath = L.polyline([], { color: '#f97316', weight: 5, opacity: 0.9 }).addTo(map);
+
+  function loadRide() {
+    try { return JSON.parse(localStorage.getItem(RIDE_KEY)); } catch (e) { return null; }
+  }
+  function saveRide() {
+    try { localStorage.setItem(RIDE_KEY, JSON.stringify(ride)); } catch (e) {}
+  }
+
+  function distanceM(a, b) {
+    const R = 6371000, toRad = x => x * Math.PI / 180;
+    const dLat = toRad(b[0] - a[0]), dLon = toRad(b[1] - a[1]);
+    const h = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(a[0])) * Math.cos(toRad(b[0])) * Math.sin(dLon / 2) ** 2;
+    return 2 * R * Math.asin(Math.sqrt(h));
+  }
+
+  function addRidePoint(lat, lon, accuracy, speed, time) {
+    if (!ride || !ride.active) return;
+    $('rSpeed').textContent = speed != null && speed >= 0 ? Math.round(speed * 3.6) : '-';
+    if (accuracy > 35) return; // מדידה לא מדויקת מדי
+    const pt = [lat, lon];
+    const last = ride.points[ride.points.length - 1];
+    if (last) {
+      const d = distanceM(last, pt);
+      if (d < Math.max(4, accuracy / 2)) return; // רעידות של GPS כשעומדים במקום
+      ride.distance += d;
+    }
+    ride.points.push(pt);
+    ridePath.addLatLng(pt);
+    saveRide();
+    renderRide();
+  }
+
+  function fmtTime(ms) {
+    const s = Math.floor(ms / 1000), h = Math.floor(s / 3600), m = Math.floor(s / 60) % 60, sec = s % 60;
+    return h ? `${h}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}` : `${m}:${String(sec).padStart(2, '0')}`;
+  }
+
+  function renderRide() {
+    if (!ride) return;
+    const elapsed = (ride.active ? Date.now() : ride.end) - ride.start;
+    $('rDist').textContent = (ride.distance / 1000).toFixed(2);
+    $('rTime').textContent = fmtTime(elapsed);
+    $('rAvg').textContent = elapsed > 0 ? Math.round(ride.distance / 1000 / (elapsed / 3600000)) : 0;
+  }
+
+  async function keepAwake() {
+    try {
+      if ('wakeLock' in navigator && ride && ride.active && document.visibilityState === 'visible') {
+        wakeLock = await navigator.wakeLock.request('screen');
+      }
+    } catch (e) {}
+  }
+  document.addEventListener('visibilitychange', keepAwake);
+
+  function setRideUI() {
+    const active = ride && ride.active;
+    $('rideBtn').textContent = active ? '⏹ עצור' : '🚴 התחל רכיבה';
+    $('rideBtn').classList.toggle('on', !!active);
+    $('rideStats').classList.toggle('show', !!ride);
+    $('rideNote').style.display = active ? 'block' : 'none';
+  }
+
+  $('rideBtn').onclick = () => {
+    if (ride && ride.active) {
+      ride.active = false;
+      ride.end = Date.now();
+      if (wakeLock) { wakeLock.release(); wakeLock = null; }
+    } else {
+      ride = { active: true, start: Date.now(), end: null, distance: 0, points: [] };
+      ridePath.setLatLngs([]);
+      $('rSpeed').textContent = '0';
+      keepAwake();
+    }
+    saveRide();
+    setRideUI();
+    renderRide();
+  };
+
+  ride = loadRide();
+  if (ride) {
+    ridePath.setLatLngs(ride.points);
+    if (ride.active) keepAwake();
+  }
+  setRideUI();
+  renderRide();
+  setInterval(() => { if (ride && ride.active) renderRide(); }, 1000);
 
   if ('geolocation' in navigator) {
     navigator.geolocation.watchPosition(onPosition, onError, {
