@@ -34,6 +34,13 @@
   #rideNote { width: 100%; font-size: 12px; color: #94a3b8; display: none; }
   .locate-btn { width: 40px; height: 40px; font-size: 20px; line-height: 40px; text-align: center; background: #fff; color: #0f172a; cursor: pointer; border-radius: 4px; }
   .locate-btn.active { background: #38bdf8; }
+  body.maponly #info { display: none; }
+  .search-box { display: flex; background: #fff; border-radius: 6px; box-shadow: 0 1px 5px rgba(0,0,0,.4); }
+  .search-box input { border: 0; padding: 9px 10px; font: inherit; font-size: 15px; width: 170px; background: transparent; color: #0f172a; outline: none; }
+  .search-box button { border: 0; background: none; padding: 0 10px; font-size: 16px; cursor: pointer; }
+  .trail-msg { background: rgba(15,23,42,.85); color: #f1f5f9; padding: 5px 10px; border-radius: 8px; font-size: 12px; display: none; margin-bottom: 22px !important; }
+  .trail-popup { direction: rtl; text-align: right; font-size: 13px; line-height: 1.5; }
+  .trail-popup b { font-size: 14px; }
 </style>
 </head>
 <body>
@@ -65,13 +72,153 @@
   const cyclosm = L.tileLayer('https://{s}.tile-cyclosm.openstreetmap.fr/cyclosm/{z}/{x}/{y}.png', {
     maxZoom: 20, attribution: '&copy; OpenStreetMap, CyclOSM'
   }).addTo(map);
+  const topo = L.tileLayer('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png', {
+    maxZoom: 17, attribution: '&copy; OpenStreetMap, OpenTopoMap (CC-BY-SA)'
+  });
+  const satellite = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+    maxZoom: 19, attribution: 'Imagery &copy; Esri'
+  });
   const bikeRoutes = L.tileLayer('https://tile.waymarkedtrails.org/cycling/{z}/{x}/{y}.png', {
     maxZoom: 18, opacity: 0.8, attribution: '&copy; waymarkedtrails.org'
+  });
+  const mtbRoutes = L.tileLayer('https://tile.waymarkedtrails.org/mtb/{z}/{x}/{y}.png', {
+    maxZoom: 18, opacity: 0.85, attribution: '&copy; waymarkedtrails.org'
   }).addTo(map);
+  const trails = L.layerGroup().addTo(map);
   L.control.layers(
-    { 'מפת אופניים': cyclosm, 'מפה רגילה': osm },
-    { 'מסלולי אופניים': bikeRoutes }
+    { 'מפת אופניים': cyclosm, 'שטח וגבהים': topo, 'לוויין': satellite, 'מפה רגילה': osm },
+    { 'שבילי שטח (לחיצים)': trails, 'מסלולי MTB מסומנים': mtbRoutes, 'מסלולי אופניים': bikeRoutes }
   ).addTo(map);
+
+  // ---- שבילי שטח מ-OpenStreetMap: שבילים ודרכי עפר, צבועים לפי רמת קושי ----
+  const TRAIL_MIN_ZOOM = 13;
+  const mtbColors = ['#16a34a', '#2563eb', '#dc2626', '#111827', '#111827', '#111827', '#111827'];
+  const mtbNames = ['קל מאוד', 'קל', 'בינוני', 'קשה', 'קשה מאוד', 'אקסטרים', 'אקסטרים'];
+  const highwayNames = { path: 'שביל', track: 'דרך עפר', bridleway: 'שביל רכיבה', cycleway: 'שביל אופניים' };
+  const surfaceNames = { dirt: 'עפר', ground: 'אדמה', gravel: 'חצץ', fine_gravel: 'חצץ דק', sand: 'חול', rock: 'סלע', grass: 'דשא', mud: 'בוץ', asphalt: 'אספלט', paved: 'סלול', compacted: 'כבוש', unpaved: 'לא סלול', pebblestone: 'חלוקים', wood: 'עץ' };
+  let trailsLoaded = null, trailsAbort = null, trailsTimer = null;
+
+  const trailMsg = L.control({ position: 'bottomleft' });
+  trailMsg.onAdd = () => L.DomUtil.create('div', 'trail-msg');
+  trailMsg.addTo(map);
+  function showTrailMsg(text) {
+    const el = trailMsg.getContainer();
+    el.textContent = text || '';
+    el.style.display = text ? 'block' : 'none';
+  }
+
+  function trailStyle(tags) {
+    const scale = parseInt(tags['mtb:scale'], 10);
+    if (!isNaN(scale)) return { color: mtbColors[Math.min(scale, 6)], weight: 5, opacity: 0.9 };
+    if (tags.highway === 'track') return { color: '#a16207', weight: 4, opacity: 0.85, dashArray: '8 6' };
+    if (tags.highway === 'cycleway') return { color: '#0ea5e9', weight: 4, opacity: 0.8 };
+    return { color: '#c2410c', weight: 3, opacity: 0.9, dashArray: '4 5' };
+  }
+
+  function trailPopup(tags, latlngs) {
+    let len = 0;
+    for (let i = 1; i < latlngs.length; i++) len += distanceM(latlngs[i - 1], latlngs[i]);
+    const scale = parseInt(tags['mtb:scale'], 10);
+    const rows = [
+      `<b>${tags.name || tags['name:he'] || highwayNames[tags.highway] || 'שביל'}</b>`,
+      `סוג: ${highwayNames[tags.highway] || tags.highway || 'מסלול'}`,
+      !isNaN(scale) ? `קושי MTB: <span style="color:${mtbColors[Math.min(scale, 6)]}">●</span> ${mtbNames[Math.min(scale, 6)]} (S${scale})` : '',
+      tags.surface ? `משטח: ${surfaceNames[tags.surface] || tags.surface}` : '',
+      tags.tracktype ? `איכות דרך: ${tags.tracktype.replace('grade', '')}/5` : '',
+      tags.bicycle === 'no' ? '🚫 אסור לאופניים' : '',
+      `אורך: ${len >= 1000 ? (len / 1000).toFixed(1) + ' ק״מ' : Math.round(len) + ' מ׳'}`
+    ];
+    return `<div class="trail-popup">${rows.filter(Boolean).join('<br>')}</div>`;
+  }
+
+  async function loadTrails() {
+    if (!map.hasLayer(trails)) return showTrailMsg('');
+    if (map.getZoom() < TRAIL_MIN_ZOOM) return showTrailMsg('🔍 התקרב כדי לראות שבילי שטח');
+    const view = map.getBounds();
+    if (trailsLoaded && trailsLoaded.contains(view)) return showTrailMsg('');
+    const area = view.pad(0.3);
+    if (trailsAbort) trailsAbort.abort();
+    trailsAbort = new AbortController();
+    showTrailMsg('⏳ טוען שבילים...');
+    const bbox = [area.getSouth(), area.getWest(), area.getNorth(), area.getEast()].map(n => n.toFixed(5)).join(',');
+    const query = `[out:json][timeout:25];(way["highway"~"^(path|track|bridleway)$"](${bbox});way["highway"="cycleway"]["mtb:scale"](${bbox}););out tags geom;`;
+    try {
+      const r = await fetch('https://overpass-api.de/api/interpreter', {
+        method: 'POST', body: 'data=' + encodeURIComponent(query), signal: trailsAbort.signal
+      });
+      if (!r.ok) throw new Error(r.status);
+      const d = await r.json();
+      trails.clearLayers();
+      for (const el of d.elements) {
+        if (!el.geometry) continue;
+        const latlngs = el.geometry.map(g => [g.lat, g.lon]);
+        L.polyline(latlngs, trailStyle(el.tags || {}))
+          .bindPopup(trailPopup(el.tags || {}, latlngs), { autoPanPaddingTopLeft: [20, 120] })
+          .addTo(trails);
+      }
+      trailsLoaded = area;
+      showTrailMsg(d.elements.length ? '' : 'אין שבילים מסומנים באזור הזה');
+    } catch (e) {
+      if (e.name !== 'AbortError') showTrailMsg('⚠️ לא הצלחתי לטעון שבילים, נסה שוב בעוד רגע');
+    }
+  }
+  function scheduleTrails() {
+    clearTimeout(trailsTimer);
+    trailsTimer = setTimeout(loadTrails, 700);
+  }
+  map.on('moveend overlayadd overlayremove', scheduleTrails);
+
+  // ---- חיפוש מקום (כמו בגוגל מפות) ----
+  const SearchControl = L.Control.extend({
+    options: { position: 'topright' },
+    onAdd() {
+      const form = L.DomUtil.create('form', 'search-box');
+      form.innerHTML = '<input type="search" placeholder="חפש מקום, יער, שביל..." enterkeyhint="search"><button type="submit">🔍</button>';
+      L.DomEvent.disableClickPropagation(form);
+      L.DomEvent.disableScrollPropagation(form);
+      form.onsubmit = async e => {
+        e.preventDefault();
+        const input = form.querySelector('input');
+        const q = input.value.trim();
+        if (!q) return;
+        input.blur();
+        try {
+          const r = await fetch(`https://nominatim.openstreetmap.org/search?format=json&limit=1&accept-language=he&q=${encodeURIComponent(q)}`);
+          const [hit] = await r.json();
+          if (!hit) { showTrailMsg('לא נמצא מקום בשם הזה'); return; }
+          setFollow(false);
+          if (hit.boundingbox) {
+            const [s, n, w, e2] = hit.boundingbox.map(Number);
+            map.fitBounds([[s, w], [n, e2]], { maxZoom: 15 });
+            if (map.getZoom() < TRAIL_MIN_ZOOM) map.setZoom(TRAIL_MIN_ZOOM); // כדי שהשבילים יופיעו מיד
+          } else {
+            map.setView([+hit.lat, +hit.lon], 15);
+          }
+        } catch (err) {
+          showTrailMsg('⚠️ החיפוש נכשל');
+        }
+      };
+      return form;
+    }
+  });
+  new SearchControl().addTo(map);
+
+  // ---- מסך מלא למפה ----
+  const FullControl = L.Control.extend({
+    options: { position: 'topleft' },
+    onAdd() {
+      const el = L.DomUtil.create('div', 'leaflet-bar locate-btn');
+      el.textContent = '⛶';
+      el.title = 'מפה במסך מלא';
+      L.DomEvent.disableClickPropagation(el);
+      el.onclick = () => {
+        document.body.classList.toggle('maponly');
+        el.classList.toggle('active');
+        map.invalidateSize();
+      };
+      return el;
+    }
+  });
 
   // המפה עוקבת אחרי המיקום עד שמזיזים אותה ביד; הכפתור 📍 מחזיר את המעקב
   let follow = true, lastLatLng = null;
@@ -90,6 +237,7 @@
     }
   });
   const locateCtl = new LocateControl().addTo(map);
+  new FullControl().addTo(map);
   function setFollow(v) {
     follow = v;
     locateCtl.getContainer().classList.toggle('active', v);
@@ -134,7 +282,7 @@
 
     if (!marker) {
       marker = L.marker([lat, lon]).addTo(map);
-      circle = L.circle([lat, lon], { radius: accuracy, color: '#38bdf8', fillOpacity: 0.15 }).addTo(map);
+      circle = L.circle([lat, lon], { radius: accuracy, color: '#38bdf8', fillOpacity: 0.15, interactive: false }).addTo(map);
     } else {
       marker.setLatLng([lat, lon]);
       circle.setLatLng([lat, lon]).setRadius(accuracy);
@@ -161,7 +309,7 @@
   // ---- רכיבה: מרחק, זמן ומהירות. נשמר בדפדפן כדי לשרוד סגירה של האפליקציה ----
   const RIDE_KEY = 'where-am-i-ride';
   let ride = null, wakeLock = null;
-  const ridePath = L.polyline([], { color: '#f97316', weight: 5, opacity: 0.9 }).addTo(map);
+  const ridePath = L.polyline([], { color: '#f97316', weight: 5, opacity: 0.9, interactive: false }).addTo(map);
 
   function loadRide() {
     try { return JSON.parse(localStorage.getItem(RIDE_KEY)); } catch (e) { return null; }
