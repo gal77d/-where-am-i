@@ -38,7 +38,7 @@
   .search-box { display: flex; background: #fff; border-radius: 6px; box-shadow: 0 1px 5px rgba(0,0,0,.4); }
   .search-box input { border: 0; padding: 9px 10px; font: inherit; font-size: 15px; width: 170px; background: transparent; color: #0f172a; outline: none; }
   .search-box button { border: 0; background: none; padding: 0 10px; font-size: 16px; cursor: pointer; }
-  .trail-msg { background: rgba(15,23,42,.85); color: #f1f5f9; padding: 5px 10px; border-radius: 8px; font-size: 12px; display: none; margin-bottom: 22px !important; }
+  .trail-msg { cursor: pointer; background: rgba(15,23,42,.85); color: #f1f5f9; padding: 5px 10px; border-radius: 8px; font-size: 12px; display: none; margin-bottom: 22px !important; }
   .trail-popup { direction: rtl; text-align: right; font-size: 13px; line-height: 1.5; }
   .trail-popup b { font-size: 14px; }
 </style>
@@ -96,10 +96,45 @@
   const mtbNames = ['קל מאוד', 'קל', 'בינוני', 'קשה', 'קשה מאוד', 'אקסטרים', 'אקסטרים'];
   const highwayNames = { path: 'שביל', track: 'דרך עפר', bridleway: 'שביל רכיבה', cycleway: 'שביל אופניים' };
   const surfaceNames = { dirt: 'עפר', ground: 'אדמה', gravel: 'חצץ', fine_gravel: 'חצץ דק', sand: 'חול', rock: 'סלע', grass: 'דשא', mud: 'בוץ', asphalt: 'אספלט', paved: 'סלול', compacted: 'כבוש', unpaved: 'לא סלול', pebblestone: 'חלוקים', wood: 'עץ' };
-  let trailsLoaded = null, trailsAbort = null, trailsTimer = null;
+  let trailsLoaded = null, trailsGen = 0, trailsTimer = null;
+  // כמה שרתים, כי השרת הראשי עמוס לפעמים
+  const OVERPASS_SERVERS = [
+    'https://overpass-api.de/api/interpreter',
+    'https://overpass.private.coffee/api/interpreter',
+    'https://maps.mail.ru/osm/tools/overpass/api/interpreter',
+    'https://overpass.kumi.systems/api/interpreter'
+  ];
+
+  async function overpass(query) {
+    let lastErr = '';
+    for (const url of OVERPASS_SERVERS) {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 20000);
+      try {
+        const r = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: 'data=' + encodeURIComponent(query),
+          signal: ctrl.signal
+        });
+        if (!r.ok) { lastErr = r.status; continue; }
+        return await r.json();
+      } catch (e) {
+        lastErr = e.name === 'AbortError' ? 'timeout' : 'network';
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+    throw new Error(lastErr);
+  }
 
   const trailMsg = L.control({ position: 'bottomleft' });
-  trailMsg.onAdd = () => L.DomUtil.create('div', 'trail-msg');
+  trailMsg.onAdd = () => {
+    const el = L.DomUtil.create('div', 'trail-msg');
+    L.DomEvent.disableClickPropagation(el);
+    el.onclick = () => { trailsLoaded = null; loadTrails(); }; // לחיצה = נסה שוב
+    return el;
+  };
   trailMsg.addTo(map);
   function showTrailMsg(text) {
     const el = trailMsg.getContainer();
@@ -136,18 +171,14 @@
     if (map.getZoom() < TRAIL_MIN_ZOOM) return showTrailMsg('🔍 התקרב כדי לראות שבילי שטח');
     const view = map.getBounds();
     if (trailsLoaded && trailsLoaded.contains(view)) return showTrailMsg('');
-    const area = view.pad(0.3);
-    if (trailsAbort) trailsAbort.abort();
-    trailsAbort = new AbortController();
+    const area = view.pad(0.15);
+    const gen = ++trailsGen;
     showTrailMsg('⏳ טוען שבילים...');
     const bbox = [area.getSouth(), area.getWest(), area.getNorth(), area.getEast()].map(n => n.toFixed(5)).join(',');
     const query = `[out:json][timeout:25];(way["highway"~"^(path|track|bridleway)$"](${bbox});way["highway"="cycleway"]["mtb:scale"](${bbox}););out tags geom;`;
     try {
-      const r = await fetch('https://overpass-api.de/api/interpreter', {
-        method: 'POST', body: 'data=' + encodeURIComponent(query), signal: trailsAbort.signal
-      });
-      if (!r.ok) throw new Error(r.status);
-      const d = await r.json();
+      const d = await overpass(query);
+      if (gen !== trailsGen) return; // המפה זזה בינתיים, בקשה חדשה כבר בדרך
       trails.clearLayers();
       for (const el of d.elements) {
         if (!el.geometry) continue;
@@ -159,7 +190,7 @@
       trailsLoaded = area;
       showTrailMsg(d.elements.length ? '' : 'אין שבילים מסומנים באזור הזה');
     } catch (e) {
-      if (e.name !== 'AbortError') showTrailMsg('⚠️ לא הצלחתי לטעון שבילים, נסה שוב בעוד רגע');
+      if (gen === trailsGen) showTrailMsg(`⚠️ לא הצלחתי לטעון שבילים (${e.message}). לחץ כאן לנסות שוב`);
     }
   }
   function scheduleTrails() {
