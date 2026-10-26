@@ -41,6 +41,9 @@
   .trail-msg { cursor: pointer; background: rgba(15,23,42,.85); color: #f1f5f9; padding: 5px 10px; border-radius: 8px; font-size: 12px; display: none; margin-bottom: 22px !important; }
   .trail-popup { direction: rtl; text-align: right; font-size: 13px; line-height: 1.5; }
   .trail-popup b { font-size: 14px; }
+  .trail-sat { width: 250px; height: 160px; border-radius: 8px; margin: 6px 0; background: #1e293b; }
+  .trail-photos { display: flex; gap: 6px; overflow-x: auto; margin-top: 6px; min-height: 20px; color: #64748b; font-size: 12px; }
+  .trail-photos img { height: 90px; border-radius: 6px; display: block; }
 </style>
 </head>
 <body>
@@ -205,6 +208,7 @@
     const links = [
       `<a href="https://www.google.com/maps/@?api=1&map_action=map&center=${lat},${lon}&zoom=18&basemap=satellite" target="_blank">🛰️ לוויין בגוגל</a>`,
       name ? `<a href="https://www.youtube.com/results?search_query=${encodeURIComponent(name + ' אופניים')}" target="_blank">🎥 סרטונים</a>` : '',
+      `<a href="https://www.mapillary.com/app/?lat=${lat}&lng=${lon}&z=17" target="_blank">📷 Mapillary</a>`,
       `<a href="https://www.openstreetmap.org/way/${id}" target="_blank">ℹ️ מקור</a>`
     ];
     const rows = [
@@ -217,7 +221,67 @@
       `אורך: ${len >= 1000 ? (len / 1000).toFixed(1) + ' ק״מ' : Math.round(len) + ' מ׳'}`,
       links.filter(Boolean).join(' · ')
     ];
-    return `<div class="trail-popup">${rows.filter(Boolean).join('<br>')}</div>`;
+    return `<div class="trail-popup">${rows.filter(Boolean).join('<br>')}` +
+      '<div class="trail-sat"></div><div class="trail-photos">📷 מחפש תמונות מהאזור...</div></div>';
+  }
+
+  // ---- תצוגה מקדימה: המסלול מצויר על תמונת לוויין, ותמונות שצולמו בסביבה ----
+  const photoCache = new Map();
+
+  async function nearbyPhotos(lat, lon, tags) {
+    const key = `${lat.toFixed(3)},${lon.toFixed(3)}`;
+    if (photoCache.has(key)) return photoCache.get(key);
+    const photos = [];
+    if (tags.image && /^https:/.test(tags.image)) photos.push({ thumb: tags.image, page: tags.image });
+    const url = 'https://commons.wikimedia.org/w/api.php?action=query&format=json&origin=*' +
+      `&generator=geosearch&ggscoord=${lat}|${lon}&ggsradius=2000&ggslimit=15&ggsnamespace=6` +
+      '&prop=imageinfo&iiprop=url|mime&iiurlwidth=320';
+    const d = await (await fetch(url)).json();
+    const pages = Object.values((d.query && d.query.pages) || {}).sort((a, b) => (a.index || 0) - (b.index || 0));
+    for (const pg of pages) {
+      const ii = pg.imageinfo && pg.imageinfo[0];
+      if (ii && /^image\/(jpeg|png|webp)/.test(ii.mime)) photos.push({ thumb: ii.thumburl, page: ii.descriptionurl });
+    }
+    photoCache.set(key, photos);
+    return photos;
+  }
+
+  // התוכן נבנה פעם אחת כאלמנט קבוע, כדי ש-Leaflet לא ידרוס את התצוגה המקדימה כשהוא מרענן את החלון
+  const popupEls = new Map();
+  function popupElement(id, tags, latlngs) {
+    if (!popupEls.has(id)) {
+      const el = document.createElement('div');
+      el.innerHTML = trailPopup(id, tags, latlngs);
+      popupEls.set(id, el);
+    }
+    return popupEls.get(id);
+  }
+
+  function openPreview(e, tags, latlngs) {
+    const root = e.popup.getElement();
+    if (!root) return;
+    const satEl = root.querySelector('.trail-sat');
+    if (satEl && !satEl._map) {
+      const mini = L.map(satEl, {
+        zoomControl: false, attributionControl: false, dragging: false, scrollWheelZoom: false,
+        doubleClickZoom: false, touchZoom: false, boxZoom: false, keyboard: false
+      });
+      L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', { maxZoom: 19 }).addTo(mini);
+      L.polyline(latlngs, { color: '#facc15', weight: 4, opacity: 0.95 }).addTo(mini);
+      mini.fitBounds(latlngs, { padding: [12, 12], maxZoom: 18 });
+      satEl._map = mini;
+      satEl.onclick = () => window.open(`https://www.google.com/maps/@?api=1&map_action=map&center=${latlngs[Math.floor(latlngs.length / 2)].join(',')}&zoom=18&basemap=satellite`, '_blank');
+      e.popup.once('remove', () => { mini.remove(); satEl._map = null; });
+    }
+    const photosEl = root.querySelector('.trail-photos');
+    const [lat, lon] = latlngs[Math.floor(latlngs.length / 2)];
+    nearbyPhotos(lat, lon, tags).then(photos => {
+      if (!photosEl.isConnected) return;
+      photosEl.innerHTML = photos.length
+        ? photos.map(p => `<a href="${esc(p.page)}" target="_blank"><img src="${esc(p.thumb)}" loading="lazy" alt=""></a>`).join('')
+        : 'אין תמונות מהאזור. נסה את הקישור ל־Mapillary';
+      e.popup.update();
+    }).catch(() => { if (photosEl.isConnected) photosEl.textContent = 'לא הצלחתי לטעון תמונות'; });
   }
 
   function drawWays(ways) {
@@ -225,7 +289,8 @@
       if (shownWays.has(id)) continue;
       shownWays.add(id);
       L.polyline(latlngs, trailStyle(tags))
-        .bindPopup(() => trailPopup(id, tags, latlngs), { autoPanPaddingTopLeft: [20, 120] })
+        .bindPopup(() => popupElement(id, tags, latlngs), { autoPanPaddingTopLeft: [20, 120], minWidth: 250, maxWidth: 270 })
+        .on('popupopen', e => openPreview(e, tags, latlngs))
         .addTo(trails);
     }
   }
