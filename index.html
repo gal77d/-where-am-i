@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>איפה אני</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui, "Segoe UI", Arial, sans-serif; background: #0f172a; color: #f1f5f9; height: 100vh; display: flex; flex-direction: column; }
+  #info { padding: 16px; display: flex; gap: 12px; flex-wrap: wrap; background: #1e293b; }
+  .card { flex: 1; min-width: 140px; background: #334155; border-radius: 12px; padding: 12px 16px; }
+  .label { font-size: 12px; color: #94a3b8; margin-bottom: 4px; }
+  .value { font-size: 20px; font-weight: 600; }
+  #temp { font-size: 32px; }
+  #map { flex: 1; }
+  #status { padding: 8px 16px; font-size: 13px; color: #fbbf24; background: #1e293b; }
+</style>
+</head>
+<body>
+  <div id="info">
+    <div class="card"><div class="label">טמפרטורה</div><div class="value" id="temp">--°</div></div>
+    <div class="card"><div class="label">מיקום</div><div class="value" id="place">מחפש...</div></div>
+    <div class="card"><div class="label">קואורדינטות</div><div class="value" id="coords" style="font-size:15px">--</div></div>
+    <div class="card"><div class="label">דיוק</div><div class="value" id="acc" style="font-size:15px">--</div></div>
+  </div>
+  <div id="status">מבקש גישה למיקום...</div>
+  <div id="map"></div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+  const map = L.map('map').setView([32.0853, 34.7818], 13);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '&copy; OpenStreetMap'
+  }).addTo(map);
+
+  let marker = null, circle = null, firstFix = true;
+  let lastWeatherTime = 0, lastGeoTime = 0;
+
+  const $ = id => document.getElementById(id);
+
+  async function updateWeather(lat, lon) {
+    if (Date.now() - lastWeatherTime < 60000) return; // פעם בדקה
+    lastWeatherTime = Date.now();
+    try {
+      const r = await fetch(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m`);
+      const d = await r.json();
+      $('temp').textContent = Math.round(d.current.temperature_2m) + '°C';
+    } catch (e) {
+      $('temp').textContent = 'שגיאה';
+    }
+  }
+
+  async function updatePlace(lat, lon) {
+    if (Date.now() - lastGeoTime < 30000) return; // פעם ב-30 שניות
+    lastGeoTime = Date.now();
+    try {
+      const r = await fetch(`https://api.bigdatacloud.net/data/reverse-geocode-client?latitude=${lat}&longitude=${lon}&localityLanguage=he`);
+      const d = await r.json();
+      const parts = [d.locality || d.city, d.countryName].filter(Boolean);
+      $('place').textContent = parts.join(', ') || 'לא ידוע';
+    } catch (e) {
+      $('place').textContent = 'לא ניתן לאתר כתובת';
+    }
+  }
+
+  function onPosition(pos) {
+    const { latitude: lat, longitude: lon, accuracy } = pos.coords;
+    $('status').style.display = 'none';
+    $('coords').textContent = `${lat.toFixed(5)}, ${lon.toFixed(5)}`;
+    $('acc').textContent = `±${Math.round(accuracy)} מ׳`;
+
+    if (!marker) {
+      marker = L.marker([lat, lon]).addTo(map);
+      circle = L.circle([lat, lon], { radius: accuracy, color: '#38bdf8', fillOpacity: 0.15 }).addTo(map);
+    } else {
+      marker.setLatLng([lat, lon]);
+      circle.setLatLng([lat, lon]).setRadius(accuracy);
+    }
+    if (firstFix) { map.setView([lat, lon], 16); firstFix = false; }
+    else { map.panTo([lat, lon]); }
+
+    updateWeather(lat, lon);
+    updatePlace(lat, lon);
+  }
+
+  function onError(err) {
+    const msgs = {
+      1: 'הגישה למיקום נחסמה. אשר מיקום בהגדרות הדפדפן.',
+      2: 'לא ניתן לקבוע מיקום.',
+      3: 'הבקשה למיקום נתקעה, מנסה שוב...'
+    };
+    $('status').style.display = 'block';
+    $('status').textContent = msgs[err.code] || 'שגיאה במיקום';
+  }
+
+  if ('geolocation' in navigator) {
+    navigator.geolocation.watchPosition(onPosition, onError, {
+      enableHighAccuracy: true, maximumAge: 0, timeout: 15000
+    });
+  } else {
+    $('status').textContent = 'הדפדפן לא תומך במיקום.';
+  }
+</script>
+</body>
+</html>
